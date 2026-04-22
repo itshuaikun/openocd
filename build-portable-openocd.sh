@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -f "$SCRIPT_DIR/configure" ]]; then
+	ROOT_DIR="$SCRIPT_DIR"
+elif [[ -f "$SCRIPT_DIR/../configure" ]]; then
+	ROOT_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+else
+	echo "ERROR: could not locate project root from $SCRIPT_DIR" >&2
+	exit 1
+fi
 IMAGE=${IMAGE:-docker.io/library/ubuntu:20.04}
 OUT_DIR=${OUT_DIR:-"$ROOT_DIR/out/portable"}
 BUILD_DIR="$OUT_DIR/build-u20"
@@ -60,6 +68,11 @@ make -j"$(nproc)"
 make install DESTDIR="$STAGE_DIR"
 
 cp -a "$STAGE_DIR/usr/." "$PKG_DIR"/
+
+if [[ -f "$ROOT_DIR/rhea_gdb_server.sh" ]]; then
+	cp "$ROOT_DIR/rhea_gdb_server.sh" "$PKG_DIR/bin/rhea_gdb_server.sh"
+	chmod +x "$PKG_DIR/bin/rhea_gdb_server.sh"
+fi
 
 # Keep runtime assets, drop install-time docs to shrink the portable bundle.
 rm -rf "$PKG_DIR/share/info" "$PKG_DIR/share/man"
@@ -131,6 +144,7 @@ Portable OpenOCD package built on Ubuntu 20.04.
 Usage:
   ./bin/openocd --version
   ./bin/openocd -f interface/dummy.cfg -f target/faux.cfg -c "init; shutdown"
+  ./bin/rhea_gdb_server.sh --list
 
 Notes:
   - This package bundles non-glibc shared libraries under ./lib.
