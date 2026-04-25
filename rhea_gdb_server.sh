@@ -16,10 +16,12 @@ else
 fi
 
 DEFAULT_ADAPTER_SPEED=1000
+DEFAULT_A55_GDB_PORT_BASE=3330 # [3330, 3337] for 8 cores
 DEFAULT_R908_GDB_PORT=4440
-DEFAULT_A55_GDB_PORT_BASE=3330
+DEFAULT_STM32F4X_GDB_PORT=5550
 PROBE_TIMEOUT_SECONDS=6
-CACHE_STALE_AFTER_SECONDS=30
+CACHE_STALE_AFTER_SECONDS=300
+UNKNOWN_CACHE_STALE_AFTER_SECONDS=10
 RUNTIME_DIR="${TMPDIR:-/tmp}/rhea_gdb_server"
 TOPOLOGY_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rhea_gdb_server/topology"
 
@@ -49,16 +51,20 @@ Usage:
   ./rhea_gdb_server.sh --list
   ./rhea_gdb_server.sh --cpu a55:N [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
   ./rhea_gdb_server.sh --cpu r908 [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
+  ./rhea_gdb_server.sh --cpu stm32f4x [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
 
 Options:
   --list                    List connected probes and detected CPUs.
-  --cpu a55:N|r908          Start gdbserver for the selected CPU target.
+  --cpu a55:N|r908|stm32f4x Start gdbserver for the selected CPU target.
   --adapter-serial SERIAL   Use the specific debugger serial number.
   --adapter-speed KHZ       Set adapter speed in kHz. Default: 1000.
-  --gdb-port PORT           GDB port. Default: 3330 for A55, 4440 for R908.
+  --gdb-port PORT           GDB port. Default: 3330 for A55, 4440 for R908, 5550 for STM32F4x.
   --openocd PATH            OpenOCD binary path. Defaults to ./rhea_gdb_server.sh sibling openocd, then PATH.
   --refresh-discovery       Ignore cached topology and probe targets again.
   -h, --help                Show this help.
+
+Environment:
+  RHEA_DEEP_USB_SCAN=1      Also probe unidentified USB devices with lsusb -v. Slower; normally not needed.
 EOF
 }
 
@@ -90,6 +96,17 @@ is_pid_running() {
 	kill -0 "$pid" 2>/dev/null
 }
 
+is_pid_zombie() {
+	local pid="$1"
+	local stat state
+
+	[[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+	stat="$(<"/proc/$pid/stat")"
+	stat="${stat##*) }"
+	state="${stat%% *}"
+	[[ "$state" == "Z" ]]
+}
+
 probe_lock_key() {
 	local adapter_type="$1"
 	local serial="$2"
@@ -119,6 +136,16 @@ probe_cache_file() {
 
 	key="$(probe_lock_key "$adapter_type" "$serial" "$usb_path")"
 	printf '%s/%s.cache' "$TOPOLOGY_DIR" "$key"
+}
+
+probe_discovery_lock_dir() {
+	local adapter_type="$1"
+	local serial="$2"
+	local usb_path="$3"
+	local key
+
+	key="$(probe_lock_key "$adapter_type" "$serial" "$usb_path")"
+	printf '%s/discovery_%s' "$RUNTIME_DIR" "$key"
 }
 
 read_lock_value() {
@@ -162,7 +189,7 @@ release_probe_lock() {
 
 valid_detected_cpu() {
 	case "$1" in
-		a55|r908|unknown)
+		a55|r908|stm32f4x|unknown)
 			return 0
 			;;
 	esac
@@ -178,6 +205,25 @@ valid_cmsis_dap_backend() {
 	return 1
 }
 
+cpu_probe_order() {
+	local preferred_cpu="${1:-}"
+
+	case "$preferred_cpu" in
+		a55)
+			printf '%s\n' "a55" "stm32f4x" "r908"
+			;;
+		r908)
+			printf '%s\n' "r908" "a55" "stm32f4x"
+			;;
+		stm32f4x)
+			printf '%s\n' "stm32f4x" "a55" "r908"
+			;;
+		*)
+			printf '%s\n' "stm32f4x" "a55" "r908"
+			;;
+	esac
+}
+
 get_cached_probe_info() {
 	local adapter_type="$1"
 	local serial="$2"
@@ -186,7 +232,7 @@ get_cached_probe_info() {
 	local current_devnum="$5"
 	local -n out_cpu_ref="$6"
 	local -n out_backend_ref="$7"
-	local cache_file detected_cpu cached_backend updated_at cached_busnum cached_devnum now
+	local cache_file detected_cpu cache_backend updated_at cached_busnum cached_devnum now max_age
 
 	out_cpu_ref=""
 	out_backend_ref=""
@@ -201,7 +247,11 @@ get_cached_probe_info() {
 	[[ "$updated_at" =~ ^[0-9]+$ ]] || return 1
 
 	now="$(date +%s)"
-	if ((now - updated_at > CACHE_STALE_AFTER_SECONDS)); then
+	max_age="$CACHE_STALE_AFTER_SECONDS"
+	if [[ "$detected_cpu" == "unknown" ]]; then
+		max_age="$UNKNOWN_CACHE_STALE_AFTER_SECONDS"
+	fi
+	if ((now - updated_at > max_age)); then
 		return 1
 	fi
 
@@ -214,12 +264,35 @@ get_cached_probe_info() {
 		return 1
 	fi
 
-	cached_backend="$(read_cache_value "$cache_file" "backend")"
-	valid_cmsis_dap_backend "$cached_backend" || cached_backend=""
+	cache_backend="$(read_cache_value "$cache_file" "backend")"
+	valid_cmsis_dap_backend "$cache_backend" || cache_backend=""
 
 	out_cpu_ref="$detected_cpu"
-	out_backend_ref="$cached_backend"
+	out_backend_ref="$cache_backend"
 	return 0
+}
+
+wait_for_cached_probe_info() {
+	local adapter_type="$1"
+	local serial="$2"
+	local usb_path="$3"
+	local current_busnum="$4"
+	local current_devnum="$5"
+	local -n out_cpu_ref="$6"
+	local -n out_backend_ref="$7"
+	local deadline cpu_value backend_value
+
+	deadline=$((SECONDS + PROBE_TIMEOUT_SECONDS + 1))
+	while ((SECONDS < deadline)); do
+		if get_cached_probe_info "$adapter_type" "$serial" "$usb_path" "$current_busnum" "$current_devnum" cpu_value backend_value; then
+			out_cpu_ref="$cpu_value"
+			out_backend_ref="$backend_value"
+			return 0
+		fi
+		sleep 0.1
+	done
+
+	return 1
 }
 
 write_probe_cache() {
@@ -230,17 +303,19 @@ write_probe_cache() {
 	local backend="$5"
 	local busnum="$6"
 	local devnum="$7"
-	local cache_file
+	local cache_file tmp_file
 
 	cache_file="$(probe_cache_file "$adapter_type" "$serial" "$usb_path")"
+	tmp_file="${cache_file}.$$"
 	mkdir -p "$TOPOLOGY_DIR"
-	cat >"$cache_file" <<EOF
+	cat >"$tmp_file" <<EOF
 updated_at=$(date +%s)
 detected_cpu=$detected_cpu
 backend=$backend
 busnum=$busnum
 devnum=$devnum
 EOF
+	mv -f "$tmp_file" "$cache_file"
 }
 
 forward_signal_to_child() {
@@ -258,6 +333,10 @@ wait_for_child_exit() {
 	[[ -n "$OPENOCD_CHILD_PID" ]] || return 0
 	deadline=$((SECONDS + timeout_seconds))
 	while is_pid_running "$OPENOCD_CHILD_PID"; do
+		if is_pid_zombie "$OPENOCD_CHILD_PID"; then
+			wait "$OPENOCD_CHILD_PID" 2>/dev/null || true
+			return 0
+		fi
 		if ((SECONDS >= deadline)); then
 			return 1
 		fi
@@ -369,7 +448,7 @@ validate_cpu_arg() {
 		return
 	fi
 
-	if [[ "$CPU_ARG" == "r908" ]]; then
+	if [[ "$CPU_ARG" == "r908" || "$CPU_ARG" == "stm32f4x" ]]; then
 		:
 	elif [[ "$CPU_ARG" =~ ^a55:([1-8])$ ]]; then
 		:
@@ -409,7 +488,7 @@ probe_type_from_text() {
 	local text="$1"
 	local lc
 
-	lc="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')"
+	lc="${text,,}"
 
 	if [[ "$lc" == *"cmsis-dap"* ]] || [[ "$lc" == *"daplink"* ]]; then
 		printf '%s' "cmsis-dap"
@@ -424,6 +503,22 @@ probe_type_from_text() {
 	printf '%s' ""
 }
 
+probe_type_from_sysfs_interfaces() {
+	local dev_dir="$1"
+	local iface_dir interface_name combined
+
+	combined=""
+	for iface_dir in "$dev_dir":*; do
+		[[ -d "$iface_dir" ]] || continue
+		interface_name="$(read_sysfs_value "$iface_dir/interface" || true)"
+		[[ -n "$interface_name" ]] || continue
+		combined+="$interface_name
+"
+	done
+
+	probe_type_from_text "$combined"
+}
+
 probe_type_from_usb() {
 	local line="$1"
 	local verbose="$2"
@@ -431,7 +526,7 @@ probe_type_from_usb() {
 
 	combined="$line
 $verbose"
-	lc="$(printf '%s' "$combined" | tr '[:upper:]' '[:lower:]')"
+	lc="${combined,,}"
 
 	if [[ "$lc" == *"cmsis-dap"* ]]; then
 		printf '%s' "cmsis-dap"
@@ -468,7 +563,7 @@ probe_backend_from_usb() {
 		return
 	fi
 
-	lc="$(printf '%s' "$verbose" | tr '[:upper:]' '[:lower:]')"
+	lc="${verbose,,}"
 
 	if [[ "$lc" == *"human interface device"* && "$lc" == *"cmsis-dap"* ]]; then
 		printf '%s' "hid"
@@ -499,7 +594,7 @@ probe_backend_from_sysfs() {
 		[[ -d "$iface_dir" ]] || continue
 		interface_name="$(read_sysfs_value "$iface_dir/interface" || true)"
 		interface_class="$(read_sysfs_value "$iface_dir/bInterfaceClass" || true)"
-		lc="$(printf '%s' "$interface_name" | tr '[:upper:]' '[:lower:]')"
+		lc="${interface_name,,}"
 		case "$interface_class:$lc" in
 			03:*cmsis-dap*|03:*daplink*)
 				has_hid=1
@@ -525,7 +620,7 @@ enumerate_probes() {
 	local verbose busnum devnum lsusb_busnum lsusb_devnum
 	local has_lsusb=0
 
-	if command -v lsusb >/dev/null 2>&1; then
+	if [[ "${RHEA_DEEP_USB_SCAN:-0}" == "1" ]] && command -v lsusb >/dev/null 2>&1; then
 		has_lsusb=1
 	fi
 
@@ -555,9 +650,12 @@ enumerate_probes() {
 $manufacturer
 $product"
 		probe_type="$(probe_type_from_text "$probe_hint")"
+		if [[ -z "$probe_type" ]]; then
+			probe_type="$(probe_type_from_sysfs_interfaces "$dev_dir")"
+		fi
 		backend="$(probe_backend_from_sysfs "$probe_type" "$dev_dir")"
 
-		if [[ -z "$probe_type" && "$has_lsusb" == "1" ]]; then
+		if [[ -z "$probe_type" && "${RHEA_DEEP_USB_SCAN:-0}" == "1" && "$has_lsusb" == "1" ]]; then
 			if [[ "$busnum" =~ ^[0-9]+$ && "$devnum" =~ ^[0-9]+$ ]]; then
 				printf -v lsusb_busnum '%03d' "$busnum"
 				printf -v lsusb_devnum '%03d' "$devnum"
@@ -611,6 +709,8 @@ probe_target() {
 	local -a match_args cmd
 	local output
 
+	resolve_openocd
+
 	case "$adapter_type" in
 		jlink)
 			interface_cfg="interface/jlink.cfg"
@@ -630,6 +730,9 @@ probe_target() {
 		r908)
 			target_cfg="target/agic/rhea/r908.discovery.cfg"
 			;;
+		stm32f4x)
+			target_cfg="target/agic/rhea/stm32f4x.cfg"
+			;;
 		*)
 			return 1
 			;;
@@ -643,6 +746,9 @@ probe_target() {
 		-f "$interface_cfg"
 		"${match_args[@]}"
 		-c "adapter speed $ADAPTER_SPEED"
+		-c "gdb port disabled"
+		-c "telnet port disabled"
+		-c "tcl port disabled"
 	)
 	if [[ "$adapter_type" == "cmsis-dap" && -n "$backend" && "$backend" != "auto" ]]; then
 		cmd+=(-c "cmsis-dap backend $backend")
@@ -665,12 +771,20 @@ probe_target() {
 
 	case "$cpu" in
 		a55)
-			if grep -Fq "SWD DPIDR 0x2ba01477" <<<"$output"; then
+			if grep -Fq "SWD DPIDR 0x2ba01477" <<<"$output" &&
+				! grep -Fq "Could not find APB-AP for debug access" <<<"$output" &&
+				! grep -Fq "Cortex-M4" <<<"$output"; then
 				return 0
 			fi
 			;;
 		r908)
 			if grep -Fq "JTAG tap: riscv_xuantie_cpu.cpu tap/device found: 0x10000b6f" <<<"$output"; then
+				return 0
+			fi
+			;;
+		stm32f4x)
+			if grep -Fq "[stm32f4x.cpu] Cortex-M4" <<<"$output" &&
+				grep -Fq "[stm32f4x.cpu] Examination succeed" <<<"$output"; then
 				return 0
 			fi
 			;;
@@ -688,33 +802,43 @@ discover_probe_cpu() {
 	local devnum="$6"
 	local preferred_cpu="${7:-}"
 	local detected_cpu="unknown"
-	local fallback_cpu=""
+	local lock_dir owner_pid cpu cached_cpu cached_backend
 
-	if [[ -n "$preferred_cpu" ]]; then
-		if probe_target "$adapter_type" "$serial" "$usb_path" "$backend" "$preferred_cpu"; then
-			detected_cpu="$preferred_cpu"
-		else
-			case "$preferred_cpu" in
-				a55)
-					fallback_cpu="r908"
-					;;
-				r908)
-					fallback_cpu="a55"
-					;;
-			esac
-			if [[ -n "$fallback_cpu" ]] && probe_target "$adapter_type" "$serial" "$usb_path" "$backend" "$fallback_cpu"; then
-				detected_cpu="$fallback_cpu"
-			fi
+	lock_dir="$(probe_discovery_lock_dir "$adapter_type" "$serial" "$usb_path")"
+	mkdir -p "$RUNTIME_DIR"
+
+	while ! mkdir "$lock_dir" 2>/dev/null; do
+		owner_pid="$(read_lock_value "$lock_dir" "owner_pid")"
+		if ! is_pid_running "$owner_pid"; then
+			rm -rf "$lock_dir"
+			continue
 		fi
-	else
-		if probe_target "$adapter_type" "$serial" "$usb_path" "$backend" "a55"; then
-			detected_cpu="a55"
-		elif probe_target "$adapter_type" "$serial" "$usb_path" "$backend" "r908"; then
-			detected_cpu="r908"
+
+		if wait_for_cached_probe_info "$adapter_type" "$serial" "$usb_path" "$busnum" "$devnum" cached_cpu cached_backend; then
+			printf '%s' "$cached_cpu"
+			return
 		fi
-	fi
+
+		printf '%s' "unknown"
+		return
+	done
+
+	cat >"$lock_dir/metadata" <<EOF
+owner_pid=$$
+adapter_type=$adapter_type
+serial=$serial
+usb_path=$usb_path
+EOF
+
+	for cpu in $(cpu_probe_order "$preferred_cpu"); do
+		if probe_target "$adapter_type" "$serial" "$usb_path" "$backend" "$cpu"; then
+			detected_cpu="$cpu"
+			break
+		fi
+	done
 
 	write_probe_cache "$adapter_type" "$serial" "$usb_path" "$detected_cpu" "$backend" "$busnum" "$devnum"
+	rm -rf "$lock_dir"
 	printf '%s' "$detected_cpu"
 }
 
@@ -856,7 +980,7 @@ find_selected_probe() {
 	local -a scope_indexes=()
 	local -a candidate_indexes=()
 	local -a verified_indexes=()
-	local index selected_count busy_match=0 busnum devnum
+	local index selected_count busy_match=0
 
 	for ((index = 0; index < ${#PROBE_TYPES[@]}; index++)); do
 		if [[ -n "$ADAPTER_SERIAL" && "${PROBE_SERIALS[index]}" != "$ADAPTER_SERIAL" ]]; then
@@ -886,29 +1010,11 @@ find_selected_probe() {
 
 	if [[ "${#candidate_indexes[@]}" -gt 0 ]]; then
 		for index in "${candidate_indexes[@]}"; do
-			if probe_target "${PROBE_TYPES[index]}" "${PROBE_SERIALS[index]}" "${PROBE_USB_PATHS[index]}" "${PROBE_BACKENDS[index]}" "$wanted_cpu"; then
-				busnum="$(read_sysfs_value "/sys/bus/usb/devices/${PROBE_USB_PATHS[index]}/busnum" || true)"
-				devnum="$(read_sysfs_value "/sys/bus/usb/devices/${PROBE_USB_PATHS[index]}/devnum" || true)"
-				write_probe_cache "${PROBE_TYPES[index]}" "${PROBE_SERIALS[index]}" "${PROBE_USB_PATHS[index]}" "$wanted_cpu" "${PROBE_BACKENDS[index]}" "$busnum" "$devnum"
-				PROBE_CPUS[index]="$wanted_cpu"
+			if [[ "$(refresh_probe_cpu_for_index "$index" "$wanted_cpu")" == "$wanted_cpu" ]]; then
 				verified_indexes+=("$index")
-			else
-				refresh_probe_cpu_for_index "$index" "$wanted_cpu" >/dev/null
 			fi
 		done
 		candidate_indexes=("${verified_indexes[@]}")
-	fi
-
-	if [[ "${#candidate_indexes[@]}" -eq 0 ]]; then
-		for index in "${scope_indexes[@]}"; do
-			if [[ "${PROBE_CPUS[index]}" == "$wanted_cpu" ]]; then
-				candidate_indexes+=("$index")
-				continue
-			fi
-			if [[ "$(refresh_probe_cpu_for_index "$index" "$wanted_cpu")" == "$wanted_cpu" ]]; then
-				candidate_indexes+=("$index")
-			fi
-		done
 	fi
 
 	selected_count="${#candidate_indexes[@]}"
@@ -948,7 +1054,7 @@ acquire_probe_lock() {
 	local target_cpu="$2"
 	local gdb_start="$3"
 	local gdb_end="$4"
-	local adapter_type serial usb_path lock_dir owner_pid
+	local adapter_type serial usb_path lock_dir
 
 	adapter_type="${PROBE_TYPES[selected_index]}"
 	serial="${PROBE_SERIALS[selected_index]}"
@@ -990,6 +1096,8 @@ launch_openocd() {
 	local adapter_type serial usb_path backend interface_cfg target_cfg port_count port_end
 	local -a match_args cmd
 
+	resolve_openocd
+
 	adapter_type="${PROBE_TYPES[selected_index]}"
 	serial="${PROBE_SERIALS[selected_index]}"
 	usb_path="${PROBE_USB_PATHS[selected_index]}"
@@ -1014,6 +1122,10 @@ launch_openocd() {
 			;;
 		r908)
 			target_cfg="target/agic/rhea/r908.cfg"
+			port_count=1
+			;;
+		stm32f4x)
+			target_cfg="target/agic/rhea/stm32f4x.cfg"
 			port_count=1
 			;;
 		*)
@@ -1044,6 +1156,8 @@ launch_openocd() {
 		"${match_args[@]}"
 		-c "adapter speed $ADAPTER_SPEED"
 		-c "gdb port $gdb_start"
+		-c "telnet port disabled"
+		-c "tcl port disabled"
 	)
 	if [[ "$adapter_type" == "cmsis-dap" && -n "$backend" && "$backend" != "auto" ]]; then
 		cmd+=(-c "cmsis-dap backend $backend")
@@ -1056,9 +1170,9 @@ launch_openocd() {
 
 	acquire_probe_lock "$selected_index" "$target_cpu" "$gdb_start" "$port_end"
 
-	trap 'forward_signal_to_child TERM; cleanup_and_exit 143' TERM
-	trap 'forward_signal_to_child INT; cleanup_and_exit 130' INT
-	trap 'forward_signal_to_child HUP; cleanup_and_exit 129' HUP
+	trap 'cleanup_and_exit 143' TERM
+	trap 'cleanup_and_exit 130' INT
+	trap 'cleanup_and_exit 129' HUP
 	trap 'release_probe_lock' EXIT
 
 	"${cmd[@]}" &
@@ -1075,13 +1189,12 @@ launch_openocd() {
 }
 
 main() {
-	local wanted_cpu selected_index core_count port_count launch_port
+	local wanted_cpu selected_index core_count launch_port
 
 	parse_args "$@"
 	require_linux
 	require_tool timeout
 	validate_cpu_arg
-	resolve_openocd
 
 	enumerate_probes
 
@@ -1095,12 +1208,16 @@ main() {
 		core_count=1
 		launch_port="${GDB_PORT:-$DEFAULT_R908_GDB_PORT}"
 		check_ports_available "$launch_port" 1
+	elif [[ "$CPU_ARG" == "stm32f4x" ]]; then
+		wanted_cpu="stm32f4x"
+		core_count=1
+		launch_port="${GDB_PORT:-$DEFAULT_STM32F4X_GDB_PORT}"
+		check_ports_available "$launch_port" 1
 	else
 		wanted_cpu="a55"
 		core_count="${CPU_ARG#a55:}"
-		port_count="$core_count"
 		launch_port="${GDB_PORT:-$DEFAULT_A55_GDB_PORT_BASE}"
-		check_ports_available "$launch_port" "$port_count"
+		check_ports_available "$launch_port" "$core_count"
 	fi
 
 	selected_index="$(find_selected_probe "$wanted_cpu")"
