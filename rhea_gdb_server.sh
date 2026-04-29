@@ -32,6 +32,7 @@ ADAPTER_SPEED="$DEFAULT_ADAPTER_SPEED"
 GDB_PORT=""
 OPENOCD_BIN=""
 REFRESH_DISCOVERY=0
+declare -a OPENOCD_COMMANDS=()
 
 declare -a PROBE_TYPES=()
 declare -a PROBE_SERIALS=()
@@ -49,9 +50,9 @@ usage() {
 Usage:
   ./rhea_gdb_server.sh
   ./rhea_gdb_server.sh --list
-  ./rhea_gdb_server.sh --cpu a55:N [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
-  ./rhea_gdb_server.sh --cpu r908 [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
-  ./rhea_gdb_server.sh --cpu stm32f4x [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH]
+  ./rhea_gdb_server.sh --cpu a55:N [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH] [-c CMD]
+  ./rhea_gdb_server.sh --cpu r908 [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH] [-c CMD]
+  ./rhea_gdb_server.sh --cpu stm32f4x [--adapter-serial SERIAL] [--adapter-speed KHZ] [--gdb-port PORT] [--openocd PATH] [-c CMD]
 
 Options:
   --list                    List connected probes and detected CPUs.
@@ -60,6 +61,7 @@ Options:
   --adapter-speed KHZ       Set adapter speed in kHz. Default: 1000.
   --gdb-port PORT           GDB port. Default: 3330 for A55, 4440 for R908, 5550 for STM32F4x.
   --openocd PATH            OpenOCD binary path. Defaults to ./rhea_gdb_server.sh sibling openocd, then PATH.
+  -c CMD                    Append an OpenOCD command after target config loading. Can be repeated.
   --refresh-discovery       Ignore cached topology and probe targets again.
   -h, --help                Show this help.
 
@@ -422,6 +424,11 @@ parse_args() {
 				OPENOCD_BIN="$2"
 				shift 2
 				;;
+			-c)
+				[[ $# -ge 2 ]] || die "-c requires a value"
+				OPENOCD_COMMANDS+=("$2")
+				shift 2
+				;;
 			--refresh-discovery)
 				REFRESH_DISCOVERY=1
 				shift
@@ -445,6 +452,7 @@ validate_number() {
 
 validate_cpu_arg() {
 	if [[ "$MODE" != "start" ]]; then
+		[[ "${#OPENOCD_COMMANDS[@]}" -eq 0 ]] || die "-c requires --cpu"
 		return
 	fi
 
@@ -1093,7 +1101,7 @@ launch_openocd() {
 	local target_cpu="$2"
 	local core_count="$3"
 	local gdb_start="$4"
-	local adapter_type serial usb_path backend interface_cfg target_cfg port_count port_end
+	local adapter_type serial usb_path backend interface_cfg target_cfg port_count port_end openocd_command
 	local -a match_args cmd
 
 	resolve_openocd
@@ -1167,6 +1175,9 @@ launch_openocd() {
 		cmd+=(-c "set CORE_COUNT $core_count; puts -nonewline \"\"")
 	fi
 	cmd+=(-f "$target_cfg")
+	for openocd_command in "${OPENOCD_COMMANDS[@]}"; do
+		cmd+=(-c "$openocd_command")
+	done
 
 	acquire_probe_lock "$selected_index" "$target_cpu" "$gdb_start" "$port_end"
 
